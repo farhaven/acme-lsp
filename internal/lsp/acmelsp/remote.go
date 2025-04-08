@@ -3,11 +3,15 @@ package acmelsp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"slices"
+	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"9fans.net/acme-lsp/internal/acmeutil"
 	"9fans.net/acme-lsp/internal/lsp"
@@ -92,6 +96,7 @@ func (rc *RemoteCmd) Completion(ctx context.Context, kind CompletionKind) error 
 	if err != nil {
 		return err
 	}
+
 	result, err := rc.server.Completion(ctx, &protocol.CompletionParams{
 		TextDocumentPositionParams: *pos,
 	})
@@ -99,28 +104,129 @@ func (rc *RemoteCmd) Completion(ctx context.Context, kind CompletionKind) error 
 		return err
 	}
 
-	if (kind == CompleteInsertFirstMatch && len(result.Items) >= 1) || (kind == CompleteInsertOnlyMatch && len(result.Items) == 1) {
-		textEdit := result.Items[0].TextEdit
-		if textEdit == nil {
-			// TODO(fhs): Use insertText or label instead.
-			return fmt.Errorf("nil TextEdit in completion item")
-		}
-		if err := text.Edit(w, []protocol.TextEdit{*textEdit}); err != nil {
-			return fmt.Errorf("failed to apply completion edit: %v", err)
+	candidates := result.Items
+	if len(candidates) > 0 && candidates[0].TextEdit == nil {
+		// The LSP gave us a bunch of candidates, but no text edit: we're supposed to do the filtering ourselves.
+		cw, err := text.CurrentWord(w)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("getting current word: %w", err)
 		}
 
-		if len(result.Items) == 1 {
-			return nil
+		cw = strings.ToLower(cw)
+
+		runeCache := make(map[string][]rune)
+		getCachedRunes := func(s string) []rune {
+			rs, ok := runeCache[s]
+			if !ok {
+				bs := []byte(s)
+				for len(bs) > 0 {
+					r, sz := utf8.DecodeRune(bs)
+					if sz == 0 || r == utf8.RuneError {
+						break
+					}
+					rs = append(rs, r)
+					bs = bs[sz:]
+				}
+				runeCache[s] = rs
+			}
+
+			return rs
+		}
+
+		subsetMatch := func(needle, haystack string) bool {
+			if len(needle) > len(haystack) {
+				return false
+			}
+
+			needleRunes := getCachedRunes(needle)
+			haystackRunes := getCachedRunes(haystack)
+
+			for _, r := range haystackRunes {
+				if len(needleRunes) == 0 {
+					// Needle exhausted: we found a match for every rune in it.
+					return true
+				}
+
+				if r == needleRunes[0] {
+					needleRunes = needleRunes[1:]
+				}
+			}
+
+			return false
+		}
+
+		candidates = slices.DeleteFunc(candidates, func(c protocol.CompletionItem) bool {
+			if c.Label == "" {
+				return true
+			}
+
+			cf := strings.ToLower(c.FilterText)
+			cl := strings.ToLower(c.Label)
+
+			if subsetMatch(cw, cf) || subsetMatch(cw, cl) {
+				return false
+			}
+
+			return true
+		})
+
+		if len(candidates) > 1000 {
+			sort.Slice(candidates, func(a, b int) bool {
+				return len(candidates[a].InsertText) < len(candidates[b].InsertText)
+			})
+			candidates = candidates[:1000]
+		}
+
+		distanceCache := make(map[string]int)
+		getCachedDistance := func(w string) int {
+			if w == "" {
+				return 0xffffff
+			}
+
+			d, ok := distanceCache[w]
+			if !ok {
+				d = LevenshteinDistance(strings.ToLower(w), cw)
+				distanceCache[w] = d
+			}
+			return d
+		}
+
+		// Sort candidates by Levenshtein distance to bring "reasonable" matches closer to the top.
+		sort.Slice(candidates, func(a, b int) bool {
+			caf := getCachedDistance(candidates[a].FilterText)
+			cal := getCachedDistance(candidates[a].Label)
+
+			da := min(caf, cal)
+
+			cbf := getCachedDistance(candidates[b].FilterText)
+			cbl := getCachedDistance(candidates[b].Label)
+
+			db := min(cbf, cbl)
+
+			return da < db
+		})
+	}
+
+	if (kind == CompleteInsertFirstMatch && len(result.Items) >= 1) || (kind == CompleteInsertOnlyMatch && len(result.Items) == 1) {
+		textEdit := candidates[0].TextEdit
+		if textEdit == nil {
+			if err := text.ReplaceWord(w, candidates[0]); err != nil {
+				return fmt.Errorf("replacing current word: %w", err)
+			}
+		} else {
+			if err := text.Edit(w, []protocol.TextEdit{*textEdit}); err != nil {
+				return fmt.Errorf("failed to apply completion edit: %v", err)
+			}
 		}
 	}
 
 	var sb strings.Builder
 
-	if len(result.Items) == 0 {
+	if len(candidates) == 0 {
 		fmt.Fprintf(&sb, "no completion\n")
 	}
 
-	for _, item := range result.Items {
+	for _, item := range candidates {
 		fmt.Fprintf(&sb, "%v\t%v\n", item.Label, item.Detail)
 	}
 

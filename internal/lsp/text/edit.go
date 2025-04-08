@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"9fans.net/acme-lsp/internal/acmeutil"
 	"9fans.net/internal/go-lsp/lsp/protocol"
 )
 
@@ -65,6 +66,104 @@ func Edit(f File, edits []protocol.TextEdit) error {
 		q0 := off.LineToOffset(int(e.Range.Start.Line), int(e.Range.Start.Character))
 		q1 := off.LineToOffset(int(e.Range.End.Line), int(e.Range.End.Character))
 		f.WriteAt(q0, q1, []byte(e.NewText))
+	}
+
+	return nil
+}
+
+const wordAddr = `-/[^a-zA-Z¡-￿0-9_]/`
+
+// CurrentWord returns the word that dot is currently on.
+func CurrentWord(f *acmeutil.Win) (string, error) {
+	_, q1, err := f.CurrentAddr()
+	if err != nil {
+		return "", fmt.Errorf("reading current address: %w", err)
+	}
+
+	err = f.Addr(wordAddr)
+	if err != nil {
+		return "", err
+	}
+
+	err = f.Ctl("dot=addr")
+	if err != nil {
+		return "", err
+	}
+
+	_, q0, err := f.CurrentAddr()
+	if err != nil {
+		return "", fmt.Errorf("getting current address: %w", err)
+	}
+
+	err = f.Addr("#%d,#%d", q0, q1)
+	if err != nil {
+		return "", err
+	}
+
+	err = f.Ctl("dot=addr")
+	if err != nil {
+		return "", err
+	}
+
+	// Current word now = addr.
+	_, err = f.Seek("body", int64(q0), 0)
+	if err != nil {
+		return "", fmt.Errorf("seeking: %w", err)
+	}
+
+	currentWord := make([]byte, q1-q0)
+	_, err = f.FileReadWriter("body").Read(currentWord)
+	if err != nil {
+		return "", fmt.Errorf("reading current word: %w", err)
+	}
+
+	return string(currentWord), nil
+}
+
+// ReplaceWord replaces the everything from the cursor to the preceeding word boundary with the given
+// text.
+func ReplaceWord(f *acmeutil.Win, item protocol.CompletionItem) error {
+	_, q1, err := f.CurrentAddr()
+	if err != nil {
+		return fmt.Errorf("reading current address: %w", err)
+	}
+
+	err = f.Addr(wordAddr)
+	if err != nil {
+		return err
+	}
+
+	err = f.Ctl("dot=addr")
+	if err != nil {
+		return err
+	}
+
+	_, q0, err := f.CurrentAddr()
+	if err != nil {
+		return fmt.Errorf("getting current address: %w", err)
+	}
+
+	err = f.Addr("#%d,#%d", q0, q1)
+	if err != nil {
+		return err
+	}
+
+	err = f.Ctl("dot=addr")
+	if err != nil {
+		return err
+	}
+
+	insertText := item.InsertText
+	if insertText == "" {
+		insertText = item.Label
+	}
+
+	f.DisableMark()
+	f.Mark()
+
+	_, err = f.WriteAt(q0, q1, []byte(insertText))
+	if err != nil {
+		return fmt.Errorf("writing replacement: %w", err)
 	}
 
 	return nil
